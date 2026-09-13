@@ -110,6 +110,21 @@ The remaining 10⁻⁵-level residual is float32 summation / interpolation detai
 **The manuscript says "median stacking"; the data and the author say mean** —
 the text should be corrected.
 
+**Frame membership.** Fitting each legacy stack onto its candidate frames
+(non-negative least squares, notebook-04 validation cell shows the result)
+reveals that six frames which pass the 1-σ radius filter were nevertheless
+*not* in the paper's stacks: `DSC_3810` (1/50 s pol1, the first frame of
+totality and 3.4× brighter than its siblings — diamond ring), `DSC_3868`
+(1/3 s pol2), `DSC_3935` (1/100 s pol3), `DSC_3952` (1/200 s pol3), `DSC_3869`
+and `DSC_3887` (1/800 s pol2); all but the first have a lunar radius that
+disagrees with the rest of their group by 3–10 px. They are listed with reasons
+in `config.EXTRA_EXCLUDED_FRAMES`; with that list the regenerated stacks match
+the legacy ones at corr ≥ 0.9997 on every plane. **So the paper's "130 useful
+frames" and the per-column frame counts in the histogram figure describe the
+radius filter, whereas the stacks actually contain 124 frames** — the
+regenerated histogram figure annotates the true counts. Set
+`EXTRA_EXCLUDED_FRAMES = {}` to stack all 130.
+
 ### Validation (notebook 99)
 
 Every regenerated product is compared with its legacy counterpart; the report is
@@ -119,8 +134,31 @@ the numbers from the last full run.
 ## Notes for the co-authors
 
 * Stacking is a **mean**, not a median (Section 3.2 of the manuscript).
+* The stacks behind Figs. 6–8 contain **124** frames, not 130: six frames that
+  pass the 1-σ lunar-radius filter were additionally left out (list and reasons
+  in `config.EXTRA_EXCLUDED_FRAMES`). Either the text/figure counts should say
+  124, or the stacks should be rebuilt with all 130 (`EXTRA_EXCLUDED_FRAMES = {}`).
 * The histogram figure previously mixed `LDIC_HDR_Images_Paras` with
   `HDR_Exposure_Normalization_Shivam` for its two HDR panels; here both panels use
   this pipeline's own products, so the whole figure has one provenance.
 * Plate scale from the lunar radius is 1.506″/px (mean CHT radius 672.3 px vs
   1012.2″); the paper quotes the optical value 1.49″/px.
+
+## Validation numbers (run of 2026-09-13, `products/validation_report.csv`)
+
+Regenerated product vs the file that went into the paper (Pearson correlation;
+stacks compared on the central 2500×3500 px window, HDR on the full frame):
+
+| product | corr |
+|---|---|
+| stacked exposures, 27 planes | 0.99967 – 0.999996 (min: 1/800 s pol2) |
+| `hdr_expnorm_pol{1,2,3}` | 0.999994 / 0.999988 / 0.999986 |
+| `hdr_ldic_pol{1,2,3}` | 0.999991 / 0.999994 / 0.999954 |
+| `expnorm_hdr_solar_frame.png` (Fig. 6) | 0.998 |
+| `ldic_hdr_solar_frame.png` (Fig. 7) | 0.999 |
+| `histogram_normalized_exposures.png` (Fig. 8) | 0.79 — same curves; the frame-count annotations now show the true stack membership and the Exp-Norm panel uses this pipeline's product instead of `HDR_Exposure_Normalization_Shivam` |
+| Sun-centre table | max Δ 0.001 px (CSV rounding) |
+| paper metadata table | identical up to the order of equal-exposure rows |
+
+Notebook run times on an M-series Mac with the SSD: 01 10 s · 02 ~75 min ·
+03 40 s · 04 5 min · 05 1 min · 06 5 min · 07 2 min · 08 40 s · 99 30 s.

@@ -102,6 +102,9 @@ def build_frame_table(
     mean_r = t["moon_radius"].mean()
     std_r = t["moon_radius"].std(ddof=0)          # np.std, as in the legacy code
     t["radius_ok"] = (t["moon_radius"] - mean_r).abs() <= nsigma * std_r
+    # frames left out of the paper's stacks on top of the radius filter
+    t["manual_ok"] = ~t["filename"].isin(config.EXTRA_EXCLUDED_FRAMES)
+    t["use"] = t["radius_ok"] & t["manual_ok"]
     t.attrs.update(moon_radius_mean=mean_r, moon_radius_std=std_r)
     return t.reset_index(drop=True)
 
@@ -109,7 +112,9 @@ def build_frame_table(
 def paper_metadata_table(frame_table: pd.DataFrame) -> pd.DataFrame:
     """Appendix table of usable frames (legacy cell 7)."""
     df = frame_table[frame_table["radius_ok"]].copy()
-    df = df.sort_values(by=["position", "exposure_time"], ascending=[True, False])
+    # legacy: sort by position then exposure (longest first); filename added as a
+    # deterministic tie-breaker (the legacy order of ties followed os.listdir)
+    df = df.sort_values(by=["position", "exposure_time", "filename"], ascending=[True, False, True])
     pos_map = {p: f"{int(a):+d}$^\\circ$".replace("+0", "0") for p, a in config.POLARIZER_ANGLE_DEG.items()}
     df["Polarization"] = df["position"].map(pos_map)
     df["Exposure"] = "1/" + df["inverse_exposure_time"].astype(int).astype(str)

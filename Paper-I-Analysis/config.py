@@ -119,8 +119,22 @@ MOON_MASK_RADIUS_PX = 695
 #                  (current scikit-image gives +/-1 px differences)
 MOON_CENTERS_SOURCE = "legacy"
 
-# Step 01 — frames whose CHT lunar radius lies outside mean +/- N*sigma are dropped
+# Step 04 — frames whose CHT lunar radius lies outside mean +/- N*sigma are dropped
 RADIUS_FILTER_NSIGMA = 1.0
+
+# Step 04 — frames additionally left out of the stacks that produced the paper.
+# Recovered by non-negative least-squares fits of the legacy stacks onto their
+# candidate frames (see README, "The stacking step"); C. Gandhi's off-line run
+# excluded these on top of the 1-sigma filter.  Set to {} to stack all 130
+# frames that pass the radius filter.
+EXTRA_EXCLUDED_FRAMES = {
+    "DSC_3810-Position1-cal.fits": "1/50 s; first frame of totality (18:40:58 UT), 3.4x brighter than its siblings (diamond ring)",
+    "DSC_3868-Position2-cal.fits": "1/3 s; first Position2 frame, lunar radius 666 px vs 669-672 px in the group",
+    "DSC_3935-Position3-cal.fits": "1/100 s; lunar radius 663 px vs 675-677 px in the group (plate scale / Sun centre off)",
+    "DSC_3952-Position3-cal.fits": "1/200 s; lunar radius 667 px vs 676 px in the group",
+    "DSC_3869-Position2-cal.fits": "1/800 s; excluded in the legacy stack (lunar radius 680 px)",
+    "DSC_3887-Position2-cal.fits": "1/800 s; excluded in the legacy stack (lunar radius 680 px)",
+}
 
 # Step 02 — circular Hough transform (two-pass: coarse on a downsampled image,
 # then +/-100 px refinement at full resolution)
