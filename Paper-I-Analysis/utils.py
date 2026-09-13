@@ -223,12 +223,43 @@ class Ephemeris:
     def __init__(self, kernel: Path | None = None,
                  lat_dms: str = config.SITE_LAT_DMS, lon_dms: str = config.SITE_LON_DMS,
                  alt_m: float = config.SITE_ALT_M):
-        from skyfield.api import Topos, load
+        from skyfield.api import Loader, Topos, load
+        kernel = Path(kernel or config.EPHEMERIS_FILE)
         self.ts = load.timescale()
-        self.eph = load(str(kernel or config.EPHEMERIS_FILE))
+        if kernel.exists():
+            self.eph = load(str(kernel))
+        else:                                   # first run on a fresh clone: fetch DE421 (16 MB) into data/
+            self.eph = Loader(str(kernel.parent))(kernel.name)
         self.observer = Topos(latitude_degrees=dms_to_decimal(lat_dms),
                               longitude_degrees=dms_to_decimal(lon_dms), elevation_m=alt_m)
         self.earth, self.sun, self.moon = self.eph["earth"], self.eph["sun"], self.eph["moon"]
+
+    def _here(self, utc_iso: str):
+        t = self.ts.from_astropy(Time(utc_iso, format="isot", scale="utc"))
+        return (self.earth + self.observer).at(t)
+
+    def apparent_sun_radec(self, utc_iso: str):
+        """Apparent (of-date) RA, Dec of the Sun in degrees."""
+        ra, dec, _ = self._here(utc_iso).observe(self.sun).apparent().radec(epoch="date")
+        return ra._degrees, dec.degrees
+
+    def star_offsets(self, utc_iso: str, stars: pd.DataFrame, body: str = "sun"):
+        """
+        For a table with columns name, ra_deg, dec_deg (ICRS), return a DataFrame of
+        separation (arcsec) and position angle (deg E of N) of each star from the
+        topocentric apparent Sun or Moon (``body``) at ``utc_iso``.
+        """
+        from skyfield.api import Star
+        here = self._here(utc_iso)
+        sun = here.observe(self.sun if body == "sun" else self.moon).apparent()
+        ra_s, dec_s, _ = sun.radec(epoch="date")
+        rows = []
+        for _, r in stars.iterrows():
+            st = here.observe(Star(ra_hours=r.ra_deg / 15.0, dec_degrees=r.dec_deg)).apparent()
+            ra, dec, _ = st.radec(epoch="date")
+            rows.append(dict(name=r["name"], sep_arcsec=sun.separation_from(st).degrees * 3600.0,
+                             pa_deg=position_angle_deg(ra_s._degrees, dec_s.degrees, ra._degrees, dec.degrees)))
+        return pd.DataFrame(rows)
 
     def sun_moon_geometry(self, utc_iso: str):
         """
@@ -249,22 +280,229 @@ class Ephemeris:
         return moon_r, sun_r, sep_arcsec, pa
 
 
+def north_east_vectors(alpha_deg: float = config.CELESTIAL_NORTH_DEG, hand: int = 1):
+    """
+    Unit vectors of celestial North and East in ARRAY coordinates (x right, y down)
+    for a North direction ``alpha_deg`` CCW from +x as displayed in camera orientation.
+    ``hand`` = -1 mirrors East (only used when fitting the handedness in notebook 03).
+    """
+    a = math.radians(alpha_deg)
+    n = np.array([math.cos(a), -math.sin(a)])
+    e = np.array([-math.sin(a), -math.cos(a)]) * hand
+    return n, e
+
+
+def sky_offset_to_pixels(sep_arcsec, pa_deg, px_per_arcsec, alpha_deg=config.CELESTIAL_NORTH_DEG, hand=1):
+    """(separation, PA east of north) -> (dx, dy) pixel offset in array coordinates."""
+    n, e = north_east_vectors(alpha_deg, hand)
+    pa = math.radians(pa_deg)
+    v = sep_arcsec * px_per_arcsec * (math.sin(pa) * e + math.cos(pa) * n)
+    return float(v[0]), float(v[1])
+
+
 def sun_center_from_moon(moon_r_arcsec, sep_arcsec, pa_deg,
                          moon_xc_px, moon_yc_px, moon_r_px,
+                         convention: str = config.SUN_CENTER_ROTATION,
+                         alpha_deg: float = config.CELESTIAL_NORTH_DEG,
                          image_north_from_y_deg: float = config.IMAGE_NORTH_ANGLE_FROM_Y_DEG):
     """
     Sun-disk centre in pixels from the Moon centre, the plate scale implied by
     the Moon's pixel radius, and the Sun-Moon displacement vector rotated into
     the image frame.  Returns (sun_xc, sun_yc, px_per_arcsec).
+
+    convention="astrometric": :func:`sky_offset_to_pixels` (validated on stars).
+    convention="legacy":      dx = sep*sin(PA-78), dy = sep*cos(PA-78) as in the
+                              legacy find_sun_center notebook (see config).
     """
     if moon_r_px <= 0 or moon_r_arcsec <= 0:
         raise ValueError("Moon radius must be positive")
     px_per_arcsec = moon_r_px / moon_r_arcsec
-    sep_px = sep_arcsec * px_per_arcsec
-    pa_img = math.radians(pa_deg - image_north_from_y_deg)
-    return (moon_xc_px + sep_px * math.sin(pa_img),
-            moon_yc_px + sep_px * math.cos(pa_img),
-            px_per_arcsec)
+    if convention == "legacy":
+        pa_img = math.radians(pa_deg - image_north_from_y_deg)
+        dx = sep_arcsec * px_per_arcsec * math.sin(pa_img)
+        dy = sep_arcsec * px_per_arcsec * math.cos(pa_img)
+    elif convention == "astrometric":
+        dx, dy = sky_offset_to_pixels(sep_arcsec, pa_deg, px_per_arcsec, alpha_deg)
+    else:
+        raise ValueError(f"unknown convention {convention!r}")
+    return moon_xc_px + dx, moon_yc_px + dy, px_per_arcsec
+
+
+# ==========================================================================
+# 3b. Background stars: detection, PSF fits, orientation fit   (notebook 03)
+# ==========================================================================
+
+def reference_star_positions(cache: Path | None = None, radius_deg: float = 1.8, vmax: float = 8.5,
+                             utc_iso: str = config.TOTALITY_MID_UTC) -> pd.DataFrame:
+    """
+    Catalogue stars (Simbad, V < ``vmax``) within ``radius_deg`` of the Sun at
+    ``utc_iso``: columns name, ra_deg, dec_deg (ICRS), vmag.  Cached in
+    data/reference_stars.csv so the notebooks work offline afterwards.
+    """
+    cache = Path(cache or config.REFERENCE_STARS_CSV)
+    if cache.exists():
+        return pd.read_csv(cache)
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    from astroquery.simbad import Simbad
+    ra, dec = Ephemeris().apparent_sun_radec(utc_iso)
+    sim = Simbad()
+    sim.add_votable_fields("V", "otype")
+    t = sim.query_region(SkyCoord(ra=ra * u.deg, dec=dec * u.deg), radius=radius_deg * u.deg).to_pandas()
+    vcol = [c for c in t.columns if c.lower() in ("v", "flux_v")][0]
+    t = t[t[vcol] < vmax].sort_values(vcol)
+    df = pd.DataFrame(dict(name=t["main_id"].str.replace(r"\s+", " ", regex=True).str.strip("* ").str.strip(),
+                           ra_deg=t["ra"].astype(float), dec_deg=t["dec"].astype(float), vmag=t[vcol].astype(float)))
+    df.to_csv(cache, index=False)
+    return df.reset_index(drop=True)
+
+
+def detect_point_sources(img, center_xy=config.SUN_CENTER_XY, min_radius=config.STAR_SEARCH_MIN_RADIUS_PX,
+                         hp_size=21, smooth=1.2, nsigma=10.0, box=31, max_sources=10):
+    """
+    Compact sources in ``img`` outside ``min_radius`` from ``center_xy``:
+    median high-pass, light Gaussian smoothing, local maxima above ``nsigma``
+    robust noise.  Returns a DataFrame (x, y, snr) sorted by SNR.
+    """
+    img = np.asarray(img, dtype=np.float32)
+    yy, xx = np.mgrid[:img.shape[0], :img.shape[1]]
+    r = np.hypot(xx - center_xy[0], yy - center_xy[1])
+    hp = img - ndimage.median_filter(img, size=hp_size)
+    sm = ndimage.gaussian_filter(hp, smooth)
+    valid = (r > min_radius) & (img > 0)
+    noise = 1.4826 * np.median(np.abs(sm[valid & (r > min_radius + 1000)]))
+    peaks = (sm == ndimage.maximum_filter(sm, size=box)) & valid & (sm > nsigma * noise)
+    ys, xs = np.nonzero(peaks)
+    df = pd.DataFrame(dict(x=xs, y=ys, snr=sm[ys, xs] / noise)).sort_values("snr", ascending=False)
+    df.attrs["noise"] = float(noise)
+    return df.head(max_sources).reset_index(drop=True), hp
+
+
+def _gauss2d(coords, amp, x0, y0, sx, sy, bg):
+    x, y = coords
+    return (amp * np.exp(-0.5 * (((x - x0) / sx) ** 2 + ((y - y0) / sy) ** 2)) + bg).ravel()
+
+
+def _gauss2d_double(coords, amp1, x1, y1, amp2, x2, y2, s, bg):
+    x, y = coords
+    g = amp1 * np.exp(-0.5 * (((x - x1) / s) ** 2 + ((y - y1) / s) ** 2))
+    g += amp2 * np.exp(-0.5 * (((x - x2) / s) ** 2 + ((y - y2) / s) ** 2))
+    return (g + bg).ravel()
+
+
+def fit_gaussian_2d(cutout, x0=None, y0=None, double=False, sep_px=None):
+    """
+    Fit a 2-D Gaussian (or two Gaussians of common width, initial separation
+    ``sep_px``) to ``cutout``.  Returns a dict with centroid(s), sigma, FWHM,
+    amplitude, background, model image and fit uncertainties (1-sigma).
+    """
+    from scipy.optimize import curve_fit
+    cut = np.asarray(cutout, dtype=np.float64)
+    h, w = cut.shape
+    yy, xx = np.mgrid[:h, :w]
+    bg0 = np.median(cut)
+    amp0 = cut.max() - bg0
+    x0 = w / 2 if x0 is None else x0
+    y0 = h / 2 if y0 is None else y0
+    if not double:
+        p0 = [amp0, x0, y0, 3.0, 3.0, bg0]
+        popt, pcov = curve_fit(_gauss2d, (xx, yy), cut.ravel(), p0=p0, maxfev=20000)
+        err = np.sqrt(np.diag(pcov))
+        sigma = float(np.hypot(popt[3], popt[4]) / np.sqrt(2))
+        return dict(x=float(popt[1]), y=float(popt[2]), x_err=float(err[1]), y_err=float(err[2]),
+                    sigma=sigma, fwhm=2.3548 * sigma, amp=float(popt[0]), bg=float(popt[5]),
+                    model=_gauss2d((xx, yy), *popt).reshape(h, w), components=1)
+    sep = sep_px or 15.0
+    p0 = [amp0, x0 - sep / 4, y0, amp0 * 0.7, x0 + sep / 4, y0, 3.0, bg0]
+    popt, pcov = curve_fit(_gauss2d_double, (xx, yy), cut.ravel(), p0=p0, maxfev=40000)
+    err = np.sqrt(np.diag(pcov))
+    a1, x1, y1, a2, x2, y2, sg, bg = popt
+    xc = (a1 * x1 + a2 * x2) / (a1 + a2)          # flux-weighted centroid of the blend
+    yc = (a1 * y1 + a2 * y2) / (a1 + a2)
+    return dict(x=float(xc), y=float(yc), x_err=float(np.hypot(err[1], err[4]) / 2), y_err=float(np.hypot(err[2], err[5]) / 2),
+                x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2), sep_px=float(np.hypot(x2 - x1, y2 - y1)),
+                sigma=float(sg), fwhm=2.3548 * float(sg), amp=float(max(a1, a2)), bg=float(bg),
+                model=_gauss2d_double((xx, yy), *popt).reshape(h, w), components=2)
+
+
+def fit_image_rotation_to_stars(measured_xy, sky_offsets, center_xy,
+                                alpha0=config.CELESTIAL_NORTH_DEG, scale0=config.PLATE_SCALE_ARCSEC_PER_PIX):
+    """
+    Least-squares fit of the North angle (deg) and plate scale (arcsec/px) — for
+    both handedness values — that map the (sep, PA) sky offsets from a reference
+    body (Sun or Moon, whose pixel position is ``center_xy``) onto the measured
+    star pixel positions.
+    Returns the best solution as a dict (alpha_deg, alpha_err, scale, scale_err,
+    hand, residuals (N,2) px, rms_px).
+    """
+    from scipy.optimize import least_squares
+    meas = np.asarray(measured_xy, dtype=float)
+    seps = np.asarray(sky_offsets["sep_arcsec"], dtype=float)
+    pas = np.asarray(sky_offsets["pa_deg"], dtype=float)
+    c = np.asarray(center_xy, dtype=float)
+
+    def model(p, hand):
+        alpha, scale = p
+        return np.array([c + np.array(sky_offset_to_pixels(s, pa, 1.0 / scale, alpha, hand)) for s, pa in zip(seps, pas)])
+
+    best = None
+    for hand in (1, -1):
+        res = least_squares(lambda p: (model(p, hand) - meas).ravel(), x0=[alpha0, scale0])
+        resid = model(res.x, hand) - meas
+        rms = float(np.sqrt(np.mean(resid ** 2)))
+        dof = max(resid.size - 2, 1)
+        cov = np.linalg.inv(res.jac.T @ res.jac) * (np.sum(resid ** 2) / dof)
+        sol = dict(alpha_deg=float(res.x[0]) % 360, alpha_err=float(np.sqrt(cov[0, 0])),
+                   scale=float(res.x[1]), scale_err=float(np.sqrt(cov[1, 1])), hand=hand,
+                   residuals=resid, rms_px=rms)
+        if best is None or rms < best["rms_px"]:
+            best = sol
+    return best
+
+
+def measure_interchannel_shift(ref, img, center_xy=config.SUN_CENTER_XY, radius_rsun=1.4, rsun_px=None,
+                               half=400, n_patches=12, dog_sigma=4.0, upsample=20):
+    """
+    Residual registration (dy, dx) of ``img`` relative to ``ref``: plain cross-
+    correlation (upsampled) of difference-of-Gaussians filtered, Hann-windowed
+    patches placed around the Sun at ``radius_rsun``; the median over patches is
+    returned together with the 75th percentile of the patch scatter.
+    (A masked annulus does not work: the mask edges dominate the correlation.)
+    """
+    from skimage.registration import phase_cross_correlation
+    rsun_px = rsun_px or (959.0 / config.PLATE_SCALE_ARCSEC_PER_PIX)
+
+    def dog(x):
+        x = np.asarray(x, dtype=np.float32)
+        hp = ndimage.gaussian_filter(x, 1.5) - ndimage.gaussian_filter(x, dog_sigma)
+        return (hp / (ndimage.gaussian_filter(np.abs(hp), 3 * dog_sigma) + 1e-9)).astype(np.float32)
+
+    A, B = dog(ref), dog(img)
+    w = np.outer(np.hanning(2 * half), np.hanning(2 * half))
+    out = []
+    for ang in np.linspace(0, 360, n_patches, endpoint=False):
+        x0 = int(center_xy[0] + radius_rsun * rsun_px * np.cos(np.radians(ang)))
+        y0 = int(center_xy[1] + radius_rsun * rsun_px * np.sin(np.radians(ang)))
+        if y0 - half < 0 or x0 - half < 0 or y0 + half > A.shape[0] or x0 + half > A.shape[1]:
+            continue
+        pa = A[y0 - half:y0 + half, x0 - half:x0 + half] * w
+        pb = B[y0 - half:y0 + half, x0 - half:x0 + half] * w
+        sh, _, _ = phase_cross_correlation(pa, pb, upsample_factor=upsample, normalization=None)
+        out.append(sh)
+    out = np.array(out)
+    med = np.median(out, axis=0)
+    spread = np.percentile(np.abs(out - med), 75, axis=0)
+    return float(med[0]), float(med[1]), float(np.hypot(*spread))
+
+
+def exposure_ratio_table(planes_by_exp: dict) -> pd.DataFrame:
+    """max(short)/max(next longer) per step of the bracket; ~0.5 per doubling = linear, ~1 = saturated."""
+    exps = list(planes_by_exp)
+    rows = []
+    for a, b in zip(exps[:-1], exps[1:]):
+        rows.append(dict(step=f"1/{a}->1/{b}", expected=b / a,
+                         ratio=float(np.max(planes_by_exp[a]) / np.max(planes_by_exp[b]))))
+    return pd.DataFrame(rows)
 
 
 # ==========================================================================
@@ -415,7 +653,7 @@ def ldic_hdr_stacking(images_in, exposure_times, images_ref=None,
                       wf_high_start_reject_percent=97.0, wf_high_reject_percent=99.9,
                       regression_weight_threshold=0.8, min_valid_segments=15,
                       sun_center_x=None, sun_center_y=None, fit_intercept=False,
-                      verbose=False):
+                      verbose=False, return_diagnostics=False):
     """
     Linear Digital Image Composer (paper Section 3.3.2, eqs. 4-5).
 
@@ -444,6 +682,7 @@ def ldic_hdr_stacking(images_in, exposure_times, images_ref=None,
 
     step = 2 * np.pi / num_angular_segments
     seg_centers = np.arange(num_angular_segments) * step + step / 2
+    diag = []
 
     for i, (f, fref) in enumerate(zip(images, refs)):
         cur_lo_rej, cur_lo_full = (0.0, 0.0) if i == 0 else (lo_rej, lo_full)
@@ -492,9 +731,17 @@ def ldic_hdr_stacking(images_in, exposure_times, images_ref=None,
         q_map = evaluate_trigonometric_polynomial(q_c, trig_poly_order_q, phi)
         g_cum += w * (k_map * f + q_map)
         w_cum += w
+        if return_diagnostics:
+            diag.append(dict(exposure_time=order[i][0], k_coeffs=k_c.copy(),
+                             k_at=evaluate_trigonometric_polynomial(k_c, trig_poly_order_k, seg_centers),
+                             segment_angles=seg_centers.copy(),
+                             segment_k=(np.array(ks) if i > 0 else np.ones(0)),
+                             segment_k_angles=(np.array(angs) if i > 0 and len(angs) else np.ones(0)),
+                             weight_fraction=float(np.mean(w > 0)), n_valid_segments=(len(angs) if i > 0 else num_angular_segments)))
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(w_cum > 0, g_cum / w_cum, 0.0)
+        g = np.where(w_cum > 0, g_cum / w_cum, 0.0)
+    return (g, diag) if return_diagnostics else g
 
 
 # ==========================================================================
@@ -639,6 +886,73 @@ def plot_solar_frame_panels(hdr_plot, mgn_plot, titles, out_png, moon_mask=False
         if i == 0:
             add_discrete_color_wheel(a, solar_north_angle)
     fig.savefig(out_png, dpi=dpi, bbox_inches="tight")
+    return fig
+
+
+def plot_exposure_histograms(hists, counts, orientation="vertical", out_stem=None, dpi=config.FIGURE_DPI):
+    """
+    Fig. 8 of the paper.  ``hists[pos]`` = list of normalised-intensity samples, one
+    per column (nine exposures, then LDIC HDR, then Exp-Norm HDR); ``counts[pos][e]`` =
+    frames stacked.  orientation="vertical" is the paper layout (intensity on y,
+    counts on x, 11 panels in a row); "horizontal" is the conventional layout
+    (intensity on x, log counts on y) in a 4 x 3 grid.
+    """
+    import matplotlib.pyplot as plt
+    colors = {"1": "red", "2": "green", "3": "blue"}
+    labels = {p: f"Pol {p} ({config.POLARIZER_ANGLE_DEG[p]:+.0f}°)".replace("+0°", "0°") for p in config.POLARIZER_POSITIONS}
+    exps = list(config.INV_EXPOSURES)
+    titles = [f"1/{e} s" for e in exps] + ["LDIC HDR", "Exp. Norm HDR"]
+    n = len(titles)
+    if orientation == "vertical":
+        fig, axes = plt.subplots(1, n, figsize=(24, 10), sharey=True)
+        axes = list(axes)
+    else:
+        fig, grid = plt.subplots(3, 4, figsize=(20, 12), sharex=True, sharey=True)
+        axes = list(grid.flat)
+    for i, ax in enumerate(axes[:n]):
+        for pos in config.POLARIZER_POSITIONS:
+            ax.hist(hists[pos][i], bins=150, color=colors[pos], alpha=0.75, histtype="step", linewidth=2.0,
+                    label=labels[pos] if i == 0 else "",
+                    orientation="horizontal" if orientation == "vertical" else "vertical")
+        if orientation == "vertical":
+            ax.set_title(titles[i], fontsize=17, fontweight="bold", pad=35)
+            if i < len(exps):
+                for x, pos in zip((0.15, 0.50, 0.85), config.POLARIZER_POSITIONS):
+                    ax.text(x, 1.02, f"{counts[pos][exps[i]]}", color=colors[pos], transform=ax.transAxes,
+                            ha="center", va="bottom", fontsize=16, fontweight="bold")
+            ax.set_xscale("log"); ax.set_ylim(0, 1.05)
+            ax.set_xlabel("Counts", fontsize=18, fontweight="bold")
+            if i == 0:
+                ax.set_ylabel("Normalized Pixel Intensity", fontsize=18, fontweight="bold", labelpad=12)
+            ax.grid(True, axis="y", alpha=0.4, linestyle="--", linewidth=1.0)
+        else:
+            ax.set_title(titles[i], fontsize=16, fontweight="bold", pad=8)
+            if i < len(exps):
+                for k, pos in enumerate(config.POLARIZER_POSITIONS):
+                    ax.text(0.97, 0.95 - 0.09 * k, f"{counts[pos][exps[i]]} frames", color=colors[pos],
+                            transform=ax.transAxes, ha="right", va="top", fontsize=13, fontweight="bold")
+            ax.set_yscale("log"); ax.set_xlim(0, 1.05)
+            ax.grid(True, axis="x", alpha=0.4, linestyle="--", linewidth=1.0)
+        for sp in ax.spines.values():
+            sp.set_linewidth(1.5)
+        ax.tick_params(axis="both", which="major", labelsize=14, width=1.5, length=6)
+        ax.tick_params(axis="both", which="minor", width=1.0, length=3)
+    if orientation == "vertical":
+        axes[0].legend(loc="upper right", fontsize=14, framealpha=0.95, edgecolor="black", fancybox=False)
+        plt.tight_layout(); plt.subplots_adjust(wspace=0.0)
+    else:
+        handles, lbls = axes[0].get_legend_handles_labels()
+        leg_ax = axes[n]
+        leg_ax.axis("off")
+        leg_ax.legend(handles, lbls, loc="center", fontsize=16, framealpha=0.95, edgecolor="black", fancybox=False)
+        for ax in grid[-1, :]:
+            ax.set_xlabel("Normalized Pixel Intensity", fontsize=16, fontweight="bold")
+        for ax in grid[:, 0]:
+            ax.set_ylabel("Counts", fontsize=16, fontweight="bold")
+        plt.tight_layout()
+    if out_stem is not None:
+        fig.savefig(f"{out_stem}.png", bbox_inches="tight", dpi=dpi)
+        fig.savefig(f"{out_stem}.pdf", bbox_inches="tight")
     return fig
 
 

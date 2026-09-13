@@ -7,6 +7,8 @@ Everything here was extracted from the legacy notebooks that produced the
 paper figures; see README.md for the provenance of each value.
 """
 
+import os
+import tomllib
 from pathlib import Path
 
 import numpy as np
@@ -14,11 +16,36 @@ import numpy as np
 # --------------------------------------------------------------------------
 # Paths
 # --------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parent            # .../Paper-I-Analysis
-SSD_ROOT = ROOT.parent                            # .../Solar Eclipse 2024 Data
+ROOT = Path(__file__).resolve().parent            # .../solar-corona-analysis/Paper-I-Analysis
+
+
+def _resolve_data_root() -> Path:
+    """Where the large, non-versioned eclipse data lives (Calibrated_Lights, legacy products).
+
+    1. $SOLAR_ECLIPSE_DATA_ROOT
+    2. local_paths.toml next to this file (git-ignored; see local_paths.example.toml)
+    3. the SSD path used by the authors
+    """
+    env = os.environ.get("SOLAR_ECLIPSE_DATA_ROOT")
+    if env:
+        root = Path(env).expanduser()
+    elif (ROOT / "local_paths.toml").exists():
+        with open(ROOT / "local_paths.toml", "rb") as f:
+            root = Path(tomllib.load(f)["data_root"]).expanduser()
+    else:
+        root = Path("/Volumes/WD_SSD/Solar Eclipse 2024 Data")
+    if not (root / "Calibrated_Lights").is_dir():
+        raise FileNotFoundError(
+            f"Data root {root} has no Calibrated_Lights/ — set SOLAR_ECLIPSE_DATA_ROOT or "
+            f"edit {ROOT / 'local_paths.toml'} (see local_paths.example.toml)")
+    return root
+
+
+DATA_ROOT = _resolve_data_root()                  # .../Solar Eclipse 2024 Data
+SSD_ROOT = DATA_ROOT                              # backwards-compatible alias
 
 # Input: APP-calibrated (dark, flat, debayer) light frames, 3-plane RGB float32
-CALIBRATED_LIGHTS_DIR = SSD_ROOT / "Calibrated_Lights"
+CALIBRATED_LIGHTS_DIR = DATA_ROOT / "Calibrated_Lights"
 
 DATA_DIR = ROOT / "data"                          # committed CSVs + ephemeris
 PRODUCTS_DIR = ROOT / "products"                  # everything regenerated
@@ -33,6 +60,10 @@ FRAME_TABLE_CSV = PRODUCTS_DIR / "frame_table.csv"
 MOON_CENTERS_CSV = PRODUCTS_DIR / "moon_centers.csv"
 SUN_MOON_CENTERS_CSV = PRODUCTS_DIR / "sun_moon_centers.csv"
 PAPER_METADATA_CSV = PRODUCTS_DIR / "paper_metadata_table.csv"
+CELESTIAL_NORTH_FIT_CSV = PRODUCTS_DIR / "celestial_north_fit.csv"
+ERROR_BUDGET_CSV = PRODUCTS_DIR / "error_budget.csv"
+REFERENCE_STARS_CSV = DATA_DIR / "reference_stars.csv"    # cached catalogue positions (notebook 03)
+DOCS_DIR = ROOT / "docs"
 
 # The tables that were actually used for the paper (copied from the SSD, for
 # validation and as a fallback if steps 02/03 are skipped).
@@ -89,11 +120,34 @@ MOON_RADIUS_KM = 1737.4
 # --------------------------------------------------------------------------
 IMAGE_SHAPE = (5504, 8256)                        # (rows, cols) of a calibrated frame
 
-# Celestial North in the instrument frame, found manually in Stellarium /
-# Affinity Photo (Fig. 5 of the paper): 168 deg CCW from the +x axis, i.e.
-# 78 deg CCW from the +y axis, which is the convention step 03 uses.
+# Celestial North in the instrument frame: 168 deg CCW from the +x axis as the
+# image is displayed in camera orientation (row 0 at the top).  Found manually
+# in Stellarium / Affinity Photo (Fig. 5 of the paper) and confirmed to 0.1 deg
+# by the star astrometry in 03_celestial_north_from_stars.ipynb.
+#
+# Convention used everywhere in this pipeline, in ARRAY coordinates (x = column
+# to the right, y = row downwards):
+#     North unit vector  n = (cos a, -sin a)
+#     East  unit vector  e = (-sin a, -cos a)
+#     a sky offset of (separation, position angle PA east of north) maps to
+#     pixel offset  sep * (sin PA * e + cos PA * n)
 CELESTIAL_NORTH_DEG = 168.0
-IMAGE_NORTH_ANGLE_FROM_Y_DEG = 78.0
+IMAGE_NORTH_ANGLE_FROM_Y_DEG = 78.0               # the legacy code's parameterisation (see below)
+
+# How the Sun-Moon displacement is rotated into the image in step 04:
+#   "astrometric" : the convention above (validated on the background stars) — default
+#   "legacy"      : dx = sep*sin(PA-78), dy = sep*cos(PA-78) as in the legacy
+#                   find_sun_center notebook.  Not consistent with the star field;
+#                   the resulting 3-11 px Sun-centre error differs between polariser
+#                   positions and was compensated downstream by the by-eye
+#                   LEGACY_CHANNEL_SHIFTS.  Use it only to reproduce the submitted figures.
+SUN_CENTER_ROTATION = "astrometric"
+
+# Background stars used to verify the orientation (notebook 03).  Positions are
+# fetched from Sesame once and cached in data/reference_stars.csv.
+REFERENCE_STARS = ("zet Psc", "88 Psc")
+ZET_PSC_SEPARATION_ARCSEC = 23.0                  # zeta Psc A-B, blended in our PSF
+STAR_SEARCH_MIN_RADIUS_PX = 1800                  # ignore the corona when looking for stars
 
 # Solar P-angle on the day (SunPy); 00_constants.ipynb recomputes it.
 SOLAR_P_ANGLE_DEG = -26.24
@@ -146,10 +200,18 @@ CHT_REFINE_HALFWIDTH_PX = 100
 LUMINANCE_WEIGHTS = (0.2126, 0.7152, 0.0722)      # R, G, B
 STACK_INTERPOLATION_ORDER = 1                     # bilinear sub-pixel shift
 
-# Steps 05/06 — empirical inter-polariser pixel offsets (dy, dx), applied to the
-# stacked images before HDR construction ("to align the plumes and make them
-# white"; determined by eye in the legacy notebooks).
-CHANNEL_SHIFTS = {"1": (3, 2), "2": (0, 0), "3": (-4, -7)}
+# Steps 06/07 — inter-polariser pixel offsets (dy, dx) applied to the stacked
+# images before HDR construction.  The legacy notebooks used by-eye values "to
+# align the plumes and make them white"; notebook 10 shows they compensate the
+# legacy Sun-centre rotation error, so with the astrometric convention no shift
+# is applied.
+LEGACY_CHANNEL_SHIFTS = {"1": (3, 2), "2": (0, 0), "3": (-4, -7)}
+CHANNEL_SHIFTS = (LEGACY_CHANNEL_SHIFTS if SUN_CENTER_ROTATION == "legacy"
+                  else {"1": (0, 0), "2": (0, 0), "3": (0, 0)})
+
+# Notebook 10 — annulus (in solar radii, plate scale below) used for the
+# frame-to-stack residual statistics
+ERROR_ANNULUS_RSUN = (1.2, 2.0)
 
 # Step 06 — Linear Digital Image Composer (Druckmullerova 2014), Section 3.3.2
 LDIC_PARAMS = dict(

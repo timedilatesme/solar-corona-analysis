@@ -1,0 +1,17 @@
+# macOS resource forks (the SSD is exFAT) — run `dot_clean -m .` if git complains
+._*
+.DS_Store
+
+# python / jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+
+# machine-specific data locations
+local_paths.toml
+
+# large regenerated products and figures (see Paper-I-Analysis/README.md)
+*/products/
+*/figures/
+*.bsp

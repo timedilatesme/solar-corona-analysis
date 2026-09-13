@@ -5,9 +5,9 @@
 #   ./run_all.sh 04 05      -> only the ones whose name starts with these prefixes
 set -euo pipefail
 cd "$(dirname "$0")"
-PY="${PAPER_I_PYTHON:-$HOME/.venvs/paper-i-analysis/bin/python}"
+PY="${PAPER_I_PYTHON:-$HOME/.venvs/solar-corona/bin/python}"
 mkdir -p products/executed
-if [ $# -eq 0 ]; then set -- 00 01 02 03 04 05 06 07 08 99; fi
+if [ $# -eq 0 ]; then set -- 00 01 02 03 04 05 06 07 08 09 10 99; fi
 for p in "$@"; do
   for nb in notebooks/${p}_*.ipynb; do
     echo "=== $(date '+%H:%M:%S') running $nb"

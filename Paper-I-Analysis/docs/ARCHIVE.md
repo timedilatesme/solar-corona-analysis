@@ -11,12 +11,12 @@ paper.
 |---|---|
 | `categorize_data.ipynb` | `01_frame_inventory` |
 | `automated_sheet_for_centers_radius_and_SB.py` (6-column CHT sheet; the one whose output is on disk) | `utils.find_moon_center_radius`, `02_moon_center_cht` |
-| `aligning_with_gemini_code/find_sun_center.ipynb` cells 9 (batch) & 11 (mosaic) + `de421.bsp` | `utils.Ephemeris`, `utils.sun_center_from_moon`, `03_sun_center_skyfield` |
-| `FINAL_PAPER_ANALYSIS/statistical_analysis_figures.ipynb` cells 3–7 (1-σ filter, metadata table) and 11 (histogram figure) | `utils.build_frame_table`, `04_select_align_stack`, `08_histogram_figure` |
-| *(no script on the SSD — C. Gandhi's off-line alignment + mean stack)* | `utils.stack_frames`, `04_select_align_stack` |
-| `FINAL_PAPER_ANALYSIS/make_exposure_norm_HDR_from_stacked_exposures_Chaitanya.ipynb` | `05_hdr_exposure_normalization` |
-| `FINAL_PAPER_ANALYSIS/make_ldic_hdr_from_stacked_exposures_Chaitanya.ipynb` | `utils.ldic_hdr_stacking`, `06_hdr_ldic` |
-| `FINAL_PAPER_ANALYSIS/exposure_norm_hdr_paper_figure_Paras.ipynb`, `ldic_hdr_paper_figure_Paras.ipynb` | `07_paper_figures` (+ `utils` §6–7) |
+| `aligning_with_gemini_code/find_sun_center.ipynb` cells 9 (batch) & 11 (mosaic) + `de421.bsp` | `utils.Ephemeris`, `utils.sun_center_from_moon`, `04_sun_center_skyfield` |
+| `FINAL_PAPER_ANALYSIS/statistical_analysis_figures.ipynb` cells 3–7 (1-σ filter, metadata table) and 11 (histogram figure) | `utils.build_frame_table`, `05_select_align_stack`, `09_histogram_figure` |
+| *(no script on the SSD — C. Gandhi's off-line alignment + mean stack)* | `utils.stack_frames`, `05_select_align_stack` |
+| `FINAL_PAPER_ANALYSIS/make_exposure_norm_HDR_from_stacked_exposures_Chaitanya.ipynb` | `06_hdr_exposure_normalization` |
+| `FINAL_PAPER_ANALYSIS/make_ldic_hdr_from_stacked_exposures_Chaitanya.ipynb` | `utils.ldic_hdr_stacking`, `07_hdr_ldic` |
+| `FINAL_PAPER_ANALYSIS/exposure_norm_hdr_paper_figure_Paras.ipynb`, `ldic_hdr_paper_figure_Paras.ipynb` | `08_paper_figures` (+ `utils` §6–7) |
 | `Sun_Linear_Composite/change_reference_frame_all_images.ipynb` cell 2 (Stokes helpers) | `utils.mzp_to_stokes`, `stokes_to_mzp` |
 | `Paper-II-Analysis/tests_Claude/pipeline_utils.py` (helper source, copied not imported) | `utils` |
 | `sun_moon_centers_output.csv`, `sheet_for_centers_and_radius_and_SB.csv`, `FINAL_PAPER_ANALYSIS/paper_metadata_documentation.csv` | `data/` |

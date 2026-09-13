@@ -1,0 +1,6 @@
+# Copy to local_paths.toml (git-ignored) and edit, or set the environment
+# variable SOLAR_ECLIPSE_DATA_ROOT.  Resolution order in config.py:
+#   1. $SOLAR_ECLIPSE_DATA_ROOT
+#   2. this file's data_root
+#   3. the default below
+data_root = "/Volumes/WD_SSD/Solar Eclipse 2024 Data"
