@@ -1,0 +1,17 @@
+numpy
+scipy
+astropy
+pandas
+matplotlib
+scikit-image
+scikit-learn
+skyfield
+sunpy[all]
+sunkit-image
+pillow
+tqdm
+python-dateutil
+jupyter
+nbformat
+nbconvert
+ipykernel
